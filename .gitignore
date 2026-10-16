@@ -1,7 +1,9 @@
-# Ignore everything except the four converter scripts
+# Ignore everything except the four converter scripts and the agent gotchas
 *
 !.gitignore
 !convert_haiku_book.py
 !convert_be_book.py
 !convert_haiku_internals.py
 !convert_haiku_deepwiki.py
+# Agent gotchas are shared; windows-haiku-gotchas.md is deliberately local-only
+!haiku-agent-gotchas.md
