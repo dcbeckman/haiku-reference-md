@@ -61,6 +61,11 @@ releases, not commits.
 - **`.rdef` syntax is strict** (e.g. the `long_info` field) — a malformed field breaks `rc`. *(pocketcalc `1a5e002`)*
 - On Haiku, **embed resources after link** with `rc -o x.rsrc x.rdef` then `xres -o <target> x.rsrc` (guard so
   off-Haiku builds skip it). *(Media-OS `8c9fbf2`, Makefile)*
+- **jam's timestamps are second-granular.** Re-applying a patch and rebuilding within the same second leaves the
+  source and the object with equal mtimes, and jam silently skips the recompile — the module links, but from the
+  old code. After any `git apply` / checkout between builds, `touch -d "+5 seconds"` the changed sources, and
+  compare the built binary against the expected one (`cmp`, or a string unique to the change) before deploying.
+  *(2026-10-15, twice in one session)*
 
 ---
 
@@ -175,7 +180,12 @@ showing up twice). *(Media-OS, 2026-06-22.)*
   ```
   Entry paths are package-relative (= relative to `/boot/system`). Find the owning package + exact paths with
   `package list -p /boot/system/packages/haiku-*.hpkg | grep <name>`. **Read only at mount → reboot to apply.**
-  Bad syntax is silently ignored (won't break boot).
+  Bad syntax is silently ignored (won't break boot). Blocklisting a **boot module** makes the boot loader log
+  `Could not load "<module>" error 80006003` (`B_ENTRY_NOT_FOUND`) on every boot — expected, not a failure.
+- ⚠️ **Reinstalling Haiku over an existing system keeps `/boot/system/settings`**, blocklist included. If the
+  replacements lived in `non-packaged` and are gone, the fresh system boots with the stock files still hidden:
+  no USB, no media/MIDI servers. Delete or check `settings/packages` after a reinstall. *(observed once,
+  2026-10-14)*
 - **A non-packaged legacy driver does not displace the stock one** — devfs scans the driver dirs and loads
   everything it finds, so a stock driver and your non-packaged one *both* load (devfs logs two `loaded driver …`
   lines then a `devfs: reload driver` reconcile that is order-dependent/racy). Blocklist the stock driver so only
@@ -224,8 +234,6 @@ showing up twice). *(Media-OS, 2026-06-22.)*
   entry shows (yours), no duplicate; removing it restores the stock entry. (The writable user
   `~/config/settings/deskbar/menu` is empty by default — the menu you see comes from the stock tree, so adding the
   *same name* there or in the non-packaged system dir overrides it.)
-- The `Media-OS` repo automates all of the above in `tools/mediaos-install.sh` / `mediaos-uninstall.sh`
-  (backup-once model, state in `~/.mediaos-install/` outside the repo).
 
 ---
 
@@ -323,7 +331,17 @@ Every item here fails **silently** — the package installs, the file is visible
   is allocated inside the controller at its compile-time `sizeof(Hub)`, and every controller statically links its
   **own** copy of `Device.cpp`, `Hub.cpp`, etc. So: whenever `usb_private.h` changes, rebuild and deploy `usb`,
   `uhci`, `ohci`, `ehci` and `xhci` **together from one tree**, and know that swapping the bus manager alone tests
-  none of its `Device`/`Hub` code. *(RenkuOS `c7942d0ed7`, 2026-09-28; `fdb7f13c5a`, 2026-10-07)*
+  none of its `Device`/`Hub` code. *(RenkuOS `c7942d0ed7`, 2026-09-28; `fdb7f13c5a`, 2026-10-07)* The same holds
+  for **`Stack.cpp`**: each controller carries its own copy of the explore code (a KDL backtrace shows
+  `Stack::Explore` running from the `ehci` image), so a change there is inert until the controllers are rebuilt and
+  deployed as well — check with `nm -D <controller>` for a symbol the change introduced. *(2026-10-16)*
+- ⚠️ **A host controller loaded from `non-packaged` (stock one blocklisted) starts AFTER the boot volume is mounted**
+  — a path a normal boot never takes, since the stock controllers are boot modules. Stock `Stack::Explore()` runs
+  inline in the controller's `Start()` under the device manager lock; after the mount, a USB disk that enumerated
+  on a UHCI/OHCI companion and is then taken back by EHCI gets unpublished from there, and the boot **deadlocks**:
+  `main2` holds "device manager" and waits for "devfs scan", held by a `device event` thread
+  (`KDiskDeviceManager`) waiting for "device manager". Test controller builds without a USB disk attached at boot,
+  or explore from the explore thread once `gBootDevice >= 0`. *(Haiku32 ICH7 2026-10-03; ICH10 2026-10-16, KDL)*
 - **Add members to a stock host-controller class at the END.** Inserting mid-class shifts offsets other modules
   were compiled against. A broken EHCI also takes out every full/low-speed device behind it, because EHCI hands
   those ports to its UHCI/OHCI **companions** — grep the boot log for `giving up port ownership` to confirm
@@ -352,6 +370,12 @@ Every item here fails **silently** — the package installs, the file is visible
   first buffer goes nowhere ("first play does nothing, second works"). *(BeTon `7085f8a`, source at hrev57937)*
 - **Changing the default audio output/input does not move a running system mixer** — restart the media server
   before measuring. *(Media-OS, 2026-10-07)*
+- ⚠️ **`BTimeSource::RealTimeFor()` / `PerformanceTimeFor()` call `debugger()` in the CALLER's team** when the
+  published drift is not exactly 1.0 and the time asked about is more than 2^24 µs (~16.8 s) from the last
+  published pair. A time source that stops updating (e.g. a node whose device stream died) therefore takes down
+  its consumers about 17 s later — typically the system mixer, freezing all audio. A node can avoid it by publishing
+  a drift of exactly 1.0 (the large-difference path is only taken then). *(seen 2026-09-30; haiku `0dc37ccfb5`,
+  `TimeSource.cpp:202-207`, `1 << FLT_MANT_DIG`)*
 - **`BMidiLocalProducer`/`Consumer` and `BMidiEndpoint` rules are in §4.**
 
 ---
@@ -395,6 +419,16 @@ Every item here fails **silently** — the package installs, the file is visible
   (cable unplugged at one end) floods KDL with junk input. `serialmark`-style markers written with
   `_kern_debug_output()` sit in the kernel line buffer until a newline — end them with `\n`.
   `_kern_kernel_debugger()` forces KDL from userland but only from a **foreground** process.
+- **Entering KDL from the keyboard:** SysRq+D with the keymap's modifier — **Alt** on the BeOS-style layout,
+  **Ctrl** on the PC-style one (Keymap preferences). For a hang: `threads 1` lists kernel threads with what each
+  waits on (`mutex 0x…`); `mutex <addr>` names the lock and its waiters, and shows the **holder only on a
+  KDEBUG-2 kernel** (master); an r1beta6 kernel (KDEBUG 1) prints no holder. `bt <id>` on each waiter.
+  *(2026-10-03 / 2026-10-16)*
+- **The syslog persists across reboots and rotates into `syslog.1`**, sometimes in the middle of a boot. Bound
+  every check at the start of the boot in question: the last `Haiku revision` line (it appears twice per boot —
+  boot loader, then kernel; take the first of the pair), reading back into `syslog.1` if it rotated.
+- **`listimage 1`** lists every loaded kernel image **with its path** — the quickest proof of which copy of a
+  driver or bus module (packaged or `non-packaged`) is actually running.
 - ⚠️ **A shallow or stale Haiku source checkout lies about history.** In a shallow clone, `git log -- <path>` for any
   file older than the boundary silently reports the boundary commit as its last change. Check
   `git rev-list --count HEAD` and the branch before citing it. **The GitHub mirror `haiku/haiku` carries no `hrev`
@@ -402,10 +436,3 @@ Every item here fails **silently** — the package installs, the file is visible
   (`gh api "repos/haiku/haiku/commits?sha=master&path=<dir>"`), never a local checkout. *(2026-09-07 / 2026-09-29)*
 - **hrev from a commit:** Haiku runs `git describe --dirty --tags --match=hrev* --abbrev=1`, strips `-g<hash>` and
   turns `-` into `+` (`build/scripts/determine_haiku_revision`): `hrev59866-79-g874f0` → `hrev59866+79`.
-
----
-
-## Hardware-specific deferred issues
-
-Device-level quirks (Hercules DJ Console RMX USB enumeration timeout, MidiSport 1x1 disconnect log spam) are tracked
-in `Media-OS/HARDWARE_ISSUES.md`, not here.
