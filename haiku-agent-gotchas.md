@@ -304,6 +304,15 @@ Every item here fails **silently** — the package installs, the file is visible
   - ⛔ Blocklisting a boot module without a working replacement → `PANIC: did not find any boot partitions`.
   *(Media-OS, measured 2026-09-22 on hrev60072+55; an earlier note claiming boot modules could not be overridden
   at all was retracted the same day.)*
+- **On-demand kernel modules** (not in `kernel/boot/` — e.g. `bus_managers/ps2`) are found by `search_module()`
+  (`module.cpp:632` as of haiku `874f0cea9d`), which tries the paths **in reverse**: `~/config/non-packaged` →
+  `~/config` → `/boot/system/non-packaged` → `/boot/system`. So a copy in `~/config/non-packaged/add-ons/kernel/…`
+  should beat stock **without a blocklist** *(code-read, not yet measured)*. Boot modules don't get this —
+  stock is preloaded before any search happens, which is why the USB stack needs the blocklist or §11's `boot/` route.
+  - ⚠️ **Place the binary as a FILE named after the module's directory component.** `vfs_get_module_path()`
+    (`fs/vfs.cpp`) descends one component at a time, so `bus_managers/ps2/v1` resolves to the file
+    `bus_managers/ps2`; a `bus_managers/ps2/ps2` layout never loads, and nothing logs why.
+  *(Media-OS, 2026-10-20)*
 - ⚠️ **The boot menu's "Disable user add-ons" disables everything outside the *packaged* system tree** — not just
   `/boot/home`. `/boot/system/non-packaged/add-ons`, `~/config/add-ons` and `~/config/non-packaged/add-ons` are all
   skipped (`module.cpp` `kFirstNonSystemModulePath`; `legacy_drivers.cpp`). If you have blocklisted stock drivers in
